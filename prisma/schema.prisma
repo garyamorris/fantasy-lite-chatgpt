@@ -1,0 +1,225 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+enum LeagueMemberRole {
+  COMMISSIONER
+  MEMBER
+}
+
+enum MatchupStatus {
+  SCHEDULED
+  FINAL
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  displayName  String
+  passwordHash String
+  role         UserRole @default(USER)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  sessions           Session[]
+  leaguesCommissioned League[]      @relation("CommissionerLeagues")
+  leagueMemberships  LeagueMember[]
+  teamsOwned         Team[]         @relation("OwnerTeams")
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Sport {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  ruleSets RuleSet[]
+  leagues  League[]
+}
+
+model RuleSet {
+  id          String   @id @default(cuid())
+  sportId     String
+  slug        String   @unique
+  name        String
+  description String?
+  config      String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  sport  Sport   @relation(fields: [sportId], references: [id], onDelete: Cascade)
+  leagues League[]
+
+  @@index([sportId])
+}
+
+model League {
+  id             String   @id @default(cuid())
+  name           String
+  sportId        String
+  ruleSetId      String
+  commissionerId String
+  currentWeek    Int      @default(1)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  sport        Sport   @relation(fields: [sportId], references: [id], onDelete: Restrict)
+  ruleSet      RuleSet @relation(fields: [ruleSetId], references: [id], onDelete: Restrict)
+  commissioner User    @relation("CommissionerLeagues", fields: [commissionerId], references: [id], onDelete: Restrict)
+
+  members          LeagueMember[]
+  teams            Team[]
+  matchups         Matchup[]
+  athleteWeekStats AthleteWeekStat[]
+
+  @@index([sportId])
+  @@index([ruleSetId])
+  @@index([commissionerId])
+}
+
+model LeagueMember {
+  id       String           @id @default(cuid())
+  leagueId String
+  userId   String
+  role     LeagueMemberRole @default(MEMBER)
+  joinedAt DateTime         @default(now())
+
+  league League @relation(fields: [leagueId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([leagueId, userId])
+  @@index([userId])
+}
+
+model Team {
+  id        String   @id @default(cuid())
+  leagueId  String
+  ownerId   String
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  league League @relation(fields: [leagueId], references: [id], onDelete: Cascade)
+  owner  User   @relation("OwnerTeams", fields: [ownerId], references: [id], onDelete: Restrict)
+
+  athletes     Athlete[]
+  lineups      Lineup[]
+  homeMatchups Matchup[] @relation("HomeTeamMatchups")
+  awayMatchups Matchup[] @relation("AwayTeamMatchups")
+
+  @@unique([leagueId, name])
+  @@index([ownerId])
+}
+
+model Athlete {
+  id        String   @id @default(cuid())
+  teamId    String
+  name      String
+  createdAt DateTime @default(now())
+
+  team  Team              @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  stats AthleteWeekStat[]
+  lineupSlots LineupSlot[]
+
+  @@index([teamId])
+}
+
+model Lineup {
+  id        String   @id @default(cuid())
+  teamId    String
+  week      Int
+  lockedAt  DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  team  Team        @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  slots LineupSlot[]
+
+  @@unique([teamId, week])
+  @@index([week])
+}
+
+model LineupSlot {
+  id        String  @id @default(cuid())
+  lineupId  String
+  slotKey   String
+  slotIndex Int
+  athleteId String?
+
+  lineup  Lineup   @relation(fields: [lineupId], references: [id], onDelete: Cascade)
+  athlete Athlete? @relation(fields: [athleteId], references: [id], onDelete: SetNull)
+
+  @@unique([lineupId, slotKey, slotIndex])
+  @@index([athleteId])
+}
+
+model Matchup {
+  id         String        @id @default(cuid())
+  leagueId   String
+  week       Int
+  homeTeamId String
+  awayTeamId String
+  status     MatchupStatus @default(SCHEDULED)
+  createdAt  DateTime      @default(now())
+
+  league   League        @relation(fields: [leagueId], references: [id], onDelete: Cascade)
+  homeTeam Team          @relation("HomeTeamMatchups", fields: [homeTeamId], references: [id], onDelete: Restrict)
+  awayTeam Team          @relation("AwayTeamMatchups", fields: [awayTeamId], references: [id], onDelete: Restrict)
+  result   MatchupResult?
+
+  @@unique([leagueId, week, homeTeamId, awayTeamId])
+  @@index([leagueId, week])
+}
+
+model MatchupResult {
+  id          String   @id @default(cuid())
+  matchupId   String   @unique
+  homeScore   Float
+  awayScore   Float
+  simulatedAt DateTime @default(now())
+
+  matchup Matchup @relation(fields: [matchupId], references: [id], onDelete: Cascade)
+}
+
+model AthleteWeekStat {
+  id        String   @id @default(cuid())
+  leagueId  String
+  week      Int
+  athleteId String
+  stats     String
+  createdAt DateTime @default(now())
+
+  league  League  @relation(fields: [leagueId], references: [id], onDelete: Cascade)
+  athlete Athlete @relation(fields: [athleteId], references: [id], onDelete: Cascade)
+
+  @@unique([leagueId, week, athleteId])
+  @@index([athleteId])
+}
