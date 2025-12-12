@@ -6,18 +6,23 @@ import { ensureLineup } from "@/lib/lineup";
 import { listStarterSlots, parseRuleSetConfig } from "@/lib/rules";
 import { Card } from "@/components/ui/Card";
 import { MatchupPlayClient } from "@/app/leagues/[leagueId]/play/play-client";
-import { lockLineupAction, simulateMatchupAction, updateLineupSlotAction } from "@/app/leagues/[leagueId]/play/actions";
+import {
+  advanceWeekAndContinueAction,
+  lockLineupAction,
+  simulateMatchupWeekAction,
+  updateLineupSlotAction,
+} from "@/app/leagues/[leagueId]/play/actions";
 
 export default async function PlayWeekPage({
   params,
   searchParams,
 }: {
   params: Promise<{ leagueId: string }>;
-  searchParams: Promise<{ teamId?: string }>;
+  searchParams: Promise<{ teamId?: string; week?: string }>;
 }) {
   const user = await requireUser();
   const { leagueId } = await params;
-  const { teamId: requestedTeamId } = await searchParams;
+  const { teamId: requestedTeamId, week: requestedWeekRaw } = await searchParams;
 
   const membership = await prisma.leagueMember.findUnique({
     where: { leagueId_userId: { leagueId, userId: user.id } },
@@ -31,6 +36,12 @@ export default async function PlayWeekPage({
   if (!league) redirect("/dashboard");
 
   const config = parseRuleSetConfig(league.ruleSet.config);
+  const currentWeek = Math.max(1, Math.min(config.schedule.weeks, league.currentWeek));
+  const requestedWeekNumber = Number.parseInt(requestedWeekRaw ?? "", 10);
+  const viewingWeek = Math.max(
+    1,
+    Math.min(config.schedule.weeks, Number.isFinite(requestedWeekNumber) ? requestedWeekNumber : currentWeek),
+  );
 
   const ownedTeams = await prisma.team.findMany({
     where: { leagueId, ownerId: user.id },
@@ -42,7 +53,7 @@ export default async function PlayWeekPage({
     return (
       <main className="container">
         <Card className="emptyState">
-          <h1>Play Week {league.currentWeek}</h1>
+          <h1>Play Week {viewingWeek}</h1>
           <p className="ui-muted">Create a team to enter the 3D matchup arena.</p>
           <Link className="ui-link" href={`/leagues/${leagueId}/teams/new`}>
             Create team
@@ -59,7 +70,7 @@ export default async function PlayWeekPage({
   const matchup = await prisma.matchup.findFirst({
     where: {
       leagueId,
-      week: league.currentWeek,
+      week: viewingWeek,
       OR: [{ homeTeamId: activeTeamId }, { awayTeamId: activeTeamId }],
     },
     include: {
@@ -73,7 +84,7 @@ export default async function PlayWeekPage({
     return (
       <main className="container">
         <Card className="emptyState">
-          <h1>Week {league.currentWeek}</h1>
+          <h1>Week {viewingWeek}</h1>
           <p className="ui-muted">No matchup is scheduled for your team this week.</p>
           <Link className="ui-link" href={`/leagues/${leagueId}`}>
             Back to league
@@ -86,7 +97,7 @@ export default async function PlayWeekPage({
   const isHome = matchup.homeTeamId === activeTeamId;
   const opponent = isHome ? matchup.awayTeam : matchup.homeTeam;
 
-  const userLineup = await ensureLineup(activeTeamId, league.currentWeek, config);
+  const userLineup = await ensureLineup(activeTeamId, viewingWeek, config);
 
   const [userLineupFull, userAthletes, opponentLineup, opponentAthletes] = await Promise.all([
     prisma.lineup.findUnique({
@@ -98,7 +109,7 @@ export default async function PlayWeekPage({
       orderBy: { createdAt: "asc" },
       select: { id: true, name: true },
     }),
-    ensureLineup(opponent.id, league.currentWeek, config),
+    ensureLineup(opponent.id, viewingWeek, config),
     prisma.athlete.findMany({
       where: { teamId: opponent.id },
       orderBy: { createdAt: "asc" },
@@ -144,7 +155,13 @@ export default async function PlayWeekPage({
   return (
     <main className="container">
       <MatchupPlayClient
-        league={{ id: league.id, name: league.name, week: league.currentWeek, weeks: config.schedule.weeks }}
+        league={{
+          id: league.id,
+          name: league.name,
+          week: viewingWeek,
+          currentWeek,
+          weeks: config.schedule.weeks,
+        }}
         rules={{
           roster: {
             starterSlots: config.roster.starterSlots,
@@ -171,9 +188,10 @@ export default async function PlayWeekPage({
         opponentSlots={opponentSlots}
         updateLineupSlotAction={updateLineupSlotAction}
         lockLineupAction={lockLineupAction}
-        simulateMatchupAction={simulateMatchupAction}
+        simulateMatchupWeekAction={simulateMatchupWeekAction}
+        isCommissioner={league.commissionerId === user.id}
+        advanceWeekAndContinueAction={advanceWeekAndContinueAction.bind(null, league.id, activeTeamId)}
       />
     </main>
   );
 }
-

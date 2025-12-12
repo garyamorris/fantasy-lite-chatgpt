@@ -83,16 +83,24 @@ const FALLBACKS: Record<ThemeId, ThreeTokens> = {
 };
 
 function canReadComputedStyle() {
+  const g = globalThis as unknown as {
+    window?: unknown;
+    document?: Document;
+    getComputedStyle?: (elt: Element) => CSSStyleDeclaration;
+  };
+
   return (
-    typeof window !== "undefined" &&
-    typeof document !== "undefined" &&
-    typeof getComputedStyle === "function"
+    typeof g.window !== "undefined" &&
+    typeof g.document !== "undefined" &&
+    typeof g.getComputedStyle === "function"
   );
 }
 
 function readVar(name: string, fallback: string) {
   if (!canReadComputedStyle()) return fallback;
-  const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  const gcs = (globalThis as unknown as { getComputedStyle?: (elt: Element) => CSSStyleDeclaration }).getComputedStyle;
+  if (typeof gcs !== "function") return fallback;
+  const value = gcs(document.documentElement).getPropertyValue(name).trim();
   return value || fallback;
 }
 

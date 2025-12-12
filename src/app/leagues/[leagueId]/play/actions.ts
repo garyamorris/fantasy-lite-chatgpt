@@ -1,5 +1,6 @@
 "use server";
 
+import { redirect } from "next/navigation";
 import { prisma } from "@/lib/db";
 import { requireUser } from "@/lib/access";
 import { ensureLineup } from "@/lib/lineup";
@@ -85,7 +86,7 @@ export async function simulateMatchupAction(leagueId: string, teamId: string) {
   if (!league || league.id !== team.leagueId) return { ok: false as const, error: "not_found" as const };
 
   const config = parseRuleSetConfig(league.ruleSet.config);
-  const week = league.currentWeek;
+  const week = Math.max(1, Math.min(config.schedule.weeks, league.currentWeek));
 
   const matchup = await prisma.matchup.findFirst({
     where: {
@@ -212,4 +213,170 @@ export async function simulateMatchupAction(leagueId: string, teamId: string) {
     awayScore,
     alreadyFinal: false as const,
   };
+}
+
+export async function simulateMatchupWeekAction(leagueId: string, teamId: string, week: number) {
+  const user = await requireUser();
+
+  const team = await prisma.team.findUnique({ where: { id: teamId } });
+  if (!team) return { ok: false as const, error: "not_found" as const };
+  if (team.ownerId !== user.id) return { ok: false as const, error: "forbidden" as const };
+
+  const league = await prisma.league.findUnique({
+    where: { id: leagueId },
+    include: { ruleSet: true },
+  });
+  if (!league || league.id !== team.leagueId) return { ok: false as const, error: "not_found" as const };
+
+  const config = parseRuleSetConfig(league.ruleSet.config);
+  const clampedWeek = Math.max(1, Math.min(config.schedule.weeks, Math.floor(week)));
+
+  const matchup = await prisma.matchup.findFirst({
+    where: {
+      leagueId,
+      week: clampedWeek,
+      OR: [{ homeTeamId: teamId }, { awayTeamId: teamId }],
+    },
+    include: { result: true },
+  });
+  if (!matchup) return { ok: false as const, error: "no_matchup" as const };
+  if (matchup.result) {
+    return {
+      ok: true as const,
+      matchupId: matchup.id,
+      homeScore: matchup.result.homeScore,
+      awayScore: matchup.result.awayScore,
+      alreadyFinal: true as const,
+    };
+  }
+
+  const homeLineup = await ensureLineup(matchup.homeTeamId, clampedWeek, config);
+  const awayLineup = await ensureLineup(matchup.awayTeamId, clampedWeek, config);
+
+  const [homeWithSlots, awayWithSlots] = await Promise.all([
+    prisma.lineup.findUnique({ where: { id: homeLineup.id }, include: { slots: true } }),
+    prisma.lineup.findUnique({ where: { id: awayLineup.id }, include: { slots: true } }),
+  ]);
+  if (!homeWithSlots || !awayWithSlots) return { ok: false as const, error: "not_found" as const };
+
+  const isUserHome = matchup.homeTeamId === teamId;
+  const userLineup = isUserHome ? homeWithSlots : awayWithSlots;
+  const opponentLineup = isUserHome ? awayWithSlots : homeWithSlots;
+
+  if (userLineup.slots.some((s) => !s.athleteId)) {
+    return { ok: false as const, error: "incomplete" as const };
+  }
+
+  // Auto-fill opponent lineup so the matchup is playable in demo flows.
+  const opponentSlotsMissing = opponentLineup.slots.filter((s) => !s.athleteId);
+  if (opponentSlotsMissing.length > 0) {
+    const opponentAthletes = await prisma.athlete.findMany({
+      where: { teamId: opponentLineup.teamId },
+      orderBy: { createdAt: "asc" },
+      select: { id: true },
+    });
+    const used = new Set(opponentLineup.slots.map((s) => s.athleteId).filter(Boolean) as string[]);
+    const available = opponentAthletes.map((a) => a.id).filter((id) => !used.has(id));
+
+    await prisma.$transaction(
+      opponentSlotsMissing.map((slot, idx) =>
+        prisma.lineupSlot.update({
+          where: { id: slot.id },
+          data: { athleteId: available[idx] ?? available[0] ?? null },
+        }),
+      ),
+    );
+  }
+
+  const [finalHome, finalAway] = await Promise.all([
+    prisma.lineup.findUnique({ where: { id: homeWithSlots.id }, include: { slots: true } }),
+    prisma.lineup.findUnique({ where: { id: awayWithSlots.id }, include: { slots: true } }),
+  ]);
+  if (!finalHome || !finalAway) return { ok: false as const, error: "not_found" as const };
+
+  const rosterAthletes = await prisma.athlete.findMany({
+    where: { teamId: { in: [finalHome.teamId, finalAway.teamId] } },
+    select: { id: true },
+  });
+  const athleteIds = rosterAthletes.map((a) => a.id);
+
+  const existingStats = await prisma.athleteWeekStat.findMany({
+    where: { leagueId, week: clampedWeek, athleteId: { in: athleteIds } },
+    select: { athleteId: true, stats: true },
+  });
+  const statsByAthlete = new Map(existingStats.map((s) => [s.athleteId, s.stats]));
+
+  const toCreate = athleteIds.filter((id) => !statsByAthlete.has(id));
+  if (toCreate.length > 0) {
+    await prisma.athleteWeekStat.createMany({
+      data: toCreate.map((athleteId) => ({
+        leagueId,
+        week: clampedWeek,
+        athleteId,
+        stats: JSON.stringify(simulateAthleteStats(config, `${leagueId}:${clampedWeek}:${athleteId}`)),
+      })),
+    });
+    const created = await prisma.athleteWeekStat.findMany({
+      where: { leagueId, week: clampedWeek, athleteId: { in: toCreate } },
+      select: { athleteId: true, stats: true },
+    });
+    for (const row of created) statsByAthlete.set(row.athleteId, row.stats);
+  }
+
+  const scoreTeam = (slots: { athleteId: string | null }[]) => {
+    let total = 0;
+    for (const slot of slots) {
+      if (!slot.athleteId) continue;
+      const statsJson = statsByAthlete.get(slot.athleteId);
+      if (!statsJson) continue;
+      total += scoreFromStats(config, parseStatsJson(statsJson));
+    }
+    return total;
+  };
+
+  const homeScore = scoreTeam(finalHome.slots);
+  const awayScore = scoreTeam(finalAway.slots);
+
+  await prisma.$transaction([
+    prisma.matchupResult.create({
+      data: {
+        matchupId: matchup.id,
+        homeScore,
+        awayScore,
+      },
+    }),
+    prisma.matchup.update({ where: { id: matchup.id }, data: { status: "FINAL" } }),
+  ]);
+
+  return {
+    ok: true as const,
+    matchupId: matchup.id,
+    homeScore,
+    awayScore,
+    alreadyFinal: false as const,
+  };
+}
+
+export async function advanceWeekAndContinueAction(leagueId: string, teamId: string | null) {
+  const user = await requireUser();
+
+  const league = await prisma.league.findUnique({
+    where: { id: leagueId },
+    include: { ruleSet: true },
+  });
+  if (!league) redirect("/dashboard");
+  if (league.commissionerId !== user.id) redirect(`/leagues/${leagueId}/play`);
+
+  const config = parseRuleSetConfig(league.ruleSet.config);
+  const nextWeek = Math.min(league.currentWeek + 1, config.schedule.weeks);
+
+  await prisma.league.update({
+    where: { id: leagueId },
+    data: { currentWeek: nextWeek },
+  });
+
+  const sp = new URLSearchParams();
+  sp.set("week", String(nextWeek));
+  if (teamId) sp.set("teamId", teamId);
+  redirect(`/leagues/${leagueId}/play?${sp.toString()}`);
 }

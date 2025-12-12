@@ -4,7 +4,7 @@ import Link from "next/link";
 import { Canvas, useFrame } from "@react-three/fiber";
 import { Float, OrbitControls, RoundedBox, Sparkles, Text, useCursor } from "@react-three/drei";
 import { EffectComposer, Bloom, Vignette } from "@react-three/postprocessing";
-import { Suspense, useCallback, useMemo, useRef, useState, useTransition } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import * as THREE from "three";
 import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
@@ -25,7 +25,7 @@ type TeamVm = { id: string; name: string };
 type AthleteVm = { id: string; name: string };
 
 type Props = {
-  league: { id: string; name: string; week: number; weeks: number };
+  league: { id: string; name: string; week: number; currentWeek: number; weeks: number };
   rules: { roster: { starterSlots: RosterSlotDef[] } };
   matchup: {
     id: string;
@@ -50,10 +50,12 @@ type Props = {
     | { ok: true; lockedAt: string | null }
     | { ok: false; error: "not_found" | "forbidden" | "locked" | "incomplete" }
   >;
-  simulateMatchupAction: (leagueId: string, teamId: string) => Promise<
+  simulateMatchupWeekAction: (leagueId: string, teamId: string, week: number) => Promise<
     | { ok: true; matchupId: string; homeScore: number; awayScore: number; alreadyFinal: boolean }
     | { ok: false; error: "not_found" | "forbidden" | "no_matchup" | "incomplete" }
   >;
+  isCommissioner: boolean;
+  advanceWeekAndContinueAction: () => Promise<void>;
 };
 
 function shortSlotLabel(slot: LineupSlotVm) {
@@ -81,13 +83,67 @@ function teamAbbr(name: string) {
   return (name.trim().slice(0, 3) || "FL").toUpperCase();
 }
 
+function fnv1a32(input: string) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+function teamColor(seed: string, sat = 0.72, light = 0.56) {
+  const h = (fnv1a32(seed) % 360) / 360;
+  const c = new THREE.Color();
+  c.setHSL(h, sat, light);
+  return `#${c.getHexString()}`;
+}
+
 function ActionError({ message }: { message: string | null }) {
   if (!message) return null;
   return <p className="ui-alert ui-alert--danger">{message}</p>;
 }
 
+type PlayStepId = "lineup" | "lock" | "play" | "review" | "next";
+
+function playHref(leagueId: string, week: number, teamId: string) {
+  const sp = new URLSearchParams();
+  sp.set("week", String(week));
+  sp.set("teamId", teamId);
+  return `/leagues/${leagueId}/play?${sp.toString()}`;
+}
+
+function PlayStepper({ step }: { step: PlayStepId }) {
+  const steps: Array<{ id: PlayStepId; label: string }> = [
+    { id: "lineup", label: "Lineup" },
+    { id: "lock", label: "Lock" },
+    { id: "play", label: "Play" },
+    { id: "review", label: "Review" },
+    { id: "next", label: "Next" },
+  ];
+
+  const idx = steps.findIndex((s) => s.id === step);
+  return (
+    <ol className="playStepper" aria-label="Play workflow steps">
+      {steps.map((s, i) => (
+        <li
+          key={s.id}
+          className={cn("playStepper__step", i < idx && "is-done", i === idx && "is-active")}
+          aria-current={i === idx ? "step" : undefined}
+        >
+          <span className="playStepper__pill">{s.label}</span>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
 export function MatchupPlayClient(props: Props) {
   const [isPending, startTransition] = useTransition();
+  const arenaFrameRef = useRef<HTMLDivElement | null>(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [coachView, setCoachView] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const [selectedSlotId, setSelectedSlotId] = useState<string | null>(props.lineup.slots[0]?.id ?? null);
   const [slots, setSlots] = useState<LineupSlotVm[]>(props.lineup.slots);
   const [lockedAt, setLockedAt] = useState<string | null>(props.lineup.lockedAt);
@@ -103,6 +159,8 @@ export function MatchupPlayClient(props: Props) {
 
   const isLocked = Boolean(lockedAt) || props.matchup.status === "FINAL";
   const isComplete = slots.every((s) => Boolean(s.athleteId));
+  const filledCount = slots.filter((s) => Boolean(s.athleteId)).length;
+  const showSidebar = coachView && !isFullscreen;
 
   const onAssignAthlete = (athleteId: string | null) => {
     if (!selectedSlot) return;
@@ -166,7 +224,7 @@ export function MatchupPlayClient(props: Props) {
   const onSimulate = () => {
     setError(null);
     startTransition(async () => {
-      const res = await props.simulateMatchupAction(props.league.id, props.userTeam.id);
+      const res = await props.simulateMatchupWeekAction(props.league.id, props.userTeam.id, props.league.week);
       if (!res.ok) {
         setError(res.error === "incomplete" ? "Fill all slots to play." : "Couldn’t simulate this matchup.");
         return;
@@ -175,25 +233,68 @@ export function MatchupPlayClient(props: Props) {
     });
   };
 
+  useEffect(() => {
+    const onFsChange = () => setIsFullscreen(Boolean(document.fullscreenElement));
+    document.addEventListener("fullscreenchange", onFsChange);
+    onFsChange();
+    return () => document.removeEventListener("fullscreenchange", onFsChange);
+  }, []);
+
+  const toggleFullscreen = useCallback(async () => {
+    const host = arenaFrameRef.current;
+    if (!host) return;
+
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen();
+        return;
+      }
+      if (typeof host.requestFullscreen !== "function") return;
+      await host.requestFullscreen();
+    } catch {
+      // Ignore fullscreen errors (browser gesture policies).
+    }
+  }, []);
+
   const weekLabel = `Week ${props.league.week}/${props.league.weeks}`;
+  const isViewingCurrentWeek = props.league.week === props.league.currentWeek;
+  const hasNextWeek = props.league.week < props.league.weeks;
+  const canAdvanceWeek =
+    props.isCommissioner && isViewingCurrentWeek && Boolean(result) && props.league.currentWeek < props.league.weeks;
+
+  const workflowStep: PlayStepId = !isComplete
+    ? "lineup"
+    : !isLocked
+      ? "lock"
+      : !result
+        ? "play"
+        : canAdvanceWeek
+          ? "next"
+          : "review";
 
   return (
-    <div className="playShell">
+    <div className={cn("playShell", !showSidebar && "playShell--focus")}>
       <header className="playHeader">
-        <div>
+        <div className="playHeader__left">
           <h1>{weekLabel}</h1>
           <p className="ui-muted">
-            {props.league.name} | {props.userTeam.name} vs {props.opponentTeam.name}
+            {props.league.name} · {props.userTeam.name} vs {props.opponentTeam.name}
+            {!isViewingCurrentWeek ? ` · Viewing (current is Week ${props.league.currentWeek})` : ""}
           </p>
+          <PlayStepper step={workflowStep} />
         </div>
 
-        <div className="playHeader__actions">
+        <div className="playHeader__right">
           {props.ownedTeams.length > 1 ? (
             <select
               className="ui-input"
               value={props.userTeam.id}
+              aria-label="Select your team"
               onChange={(e) => {
-                window.location.search = `?teamId=${encodeURIComponent(e.target.value)}`;
+                const sp = new URLSearchParams(window.location.search);
+                sp.set("teamId", e.target.value);
+                sp.set("week", String(props.league.week));
+                window.location.search = `?${sp.toString()}`;
               }}
             >
               {props.ownedTeams.map((t) => (
@@ -203,49 +304,200 @@ export function MatchupPlayClient(props: Props) {
               ))}
             </select>
           ) : null}
-          <Link href={`/leagues/${props.league.id}#history`} className="ui-button ui-button--secondary ui-button--md">
-            History
-          </Link>
-          <Link
-            href={`/leagues/${props.league.id}/analytics`}
-            className="ui-button ui-button--secondary ui-button--md"
-          >
-            Analytics
-          </Link>
-          <Button type="button" variant="secondary" onClick={onAutoFill} disabled={isLocked || isPending}>
-            Auto-fill
-          </Button>
-          <Button type="button" variant="secondary" onClick={onLock} disabled={isLocked || !isComplete || isPending}>
-            {lockedAt ? "Locked" : "Lock lineup"}
-          </Button>
-          <Button type="button" onClick={onSimulate} disabled={(!isComplete && !result) || isPending}>
-            {result ? "View result" : "Reveal outcome"}
-          </Button>
         </div>
       </header>
 
       <ActionError message={error} />
 
-      <div className="playGrid">
+      <div className={cn("playGrid", !showSidebar && "playGrid--focus")}>
         <Card className="playCanvasCard">
-          <div className="playCanvasFrame">
-            <Suspense fallback={<div className="ui-muted">Loading arena…</div>}>
+          <div ref={arenaFrameRef} className="playCanvasFrame">
+            <Suspense fallback={<div className="ui-muted">Loading arena...</div>}>
               <Arena3D
                 userTeam={props.userTeam}
                 opponentTeam={props.opponentTeam}
                 slots={slots}
                 opponentSlots={props.opponentSlots}
                 selectedSlotId={selectedSlotId}
-                onSelectSlot={(id) => setSelectedSlotId(id)}
+                onSelectSlot={(id) => {
+                  setSelectedSlotId(id);
+                  if (!showSidebar) setDrawerOpen(true);
+                }}
                 athleteName={athleteName}
                 opponentAthleteName={opponentAthleteName}
                 result={result}
                 matchup={props.matchup}
+                matchState={!isComplete ? "building" : isLocked && !result ? "locked" : result ? "final" : "ready"}
               />
             </Suspense>
+
+            <div className="arenaOverlay" aria-label="Arena controls">
+              <div className="arenaOverlay__bar">
+                <div className="arenaOverlay__left">
+                  <Link
+                    className={cn(
+                      "ui-button ui-button--secondary ui-button--sm",
+                      props.league.week <= 1 && "is-disabled",
+                    )}
+                    aria-disabled={props.league.week <= 1}
+                    tabIndex={props.league.week <= 1 ? -1 : 0}
+                    href={playHref(props.league.id, Math.max(1, props.league.week - 1), props.userTeam.id)}
+                  >
+                    Prev
+                  </Link>
+                  <Link
+                    className={cn(
+                      "ui-button ui-button--secondary ui-button--sm",
+                      props.league.week >= props.league.weeks && "is-disabled",
+                    )}
+                    aria-disabled={props.league.week >= props.league.weeks}
+                    tabIndex={props.league.week >= props.league.weeks ? -1 : 0}
+                    href={playHref(
+                      props.league.id,
+                      Math.min(props.league.weeks, props.league.week + 1),
+                      props.userTeam.id,
+                    )}
+                  >
+                    Next
+                  </Link>
+                  <div className="arenaOverlay__meta ui-muted">
+                    Lineup {filledCount}/{slots.length} {isLocked ? "· Locked" : ""}
+                  </div>
+                </div>
+
+                <div className="arenaOverlay__center">
+                  {!isComplete ? (
+                    <Button type="button" size="sm" onClick={onAutoFill} disabled={isLocked || isPending}>
+                      Auto-fill
+                    </Button>
+                  ) : !isLocked ? (
+                    <Button type="button" size="sm" onClick={onLock} disabled={isLocked || isPending}>
+                      Lock lineup
+                    </Button>
+                  ) : !result ? (
+                    <Button type="button" size="sm" onClick={onSimulate} disabled={isPending}>
+                      Play &amp; reveal
+                    </Button>
+                  ) : hasNextWeek ? (
+                    canAdvanceWeek ? (
+                      <form action={props.advanceWeekAndContinueAction}>
+                        <button className="ui-button ui-button--primary ui-button--sm" type="submit" disabled={isPending}>
+                          Advance to Week {props.league.currentWeek + 1}
+                        </button>
+                      </form>
+                    ) : props.league.currentWeek > props.league.week ? (
+                      <Link
+                        className="ui-button ui-button--primary ui-button--sm"
+                        href={playHref(props.league.id, props.league.week + 1, props.userTeam.id)}
+                      >
+                        Continue to Week {props.league.week + 1}
+                      </Link>
+                    ) : (
+                      <div className="arenaOverlay__waiting ui-muted">Waiting for commissioner...</div>
+                    )
+                  ) : (
+                    <div className="arenaOverlay__waiting ui-muted">Season complete</div>
+                  )}
+                </div>
+
+                <div className="arenaOverlay__right">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => {
+                      if (!showSidebar) setDrawerOpen((v) => !v);
+                      else setCoachView(false);
+                    }}
+                    disabled={isPending}
+                  >
+                    {showSidebar ? "Focus view" : "Lineup"}
+                  </Button>
+
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => setCoachView((v) => !v)}
+                    disabled={isPending || isFullscreen}
+                    title={isFullscreen ? "Exit full screen to use coach view." : undefined}
+                  >
+                    Coach
+                  </Button>
+
+                  <Button type="button" size="sm" variant="secondary" onClick={toggleFullscreen} disabled={isPending}>
+                    {isFullscreen ? "Exit full screen" : "Full screen"}
+                  </Button>
+                </div>
+              </div>
+            </div>
+
+            <section className={cn("arenaDrawer", drawerOpen && "arenaDrawer--open")} aria-label="Lineup editor">
+              <div className="arenaDrawer__header">
+                <div>
+                  <div className="arenaDrawer__title">Lineup</div>
+                  <div className="arenaDrawer__meta ui-muted">
+                    {filledCount}/{slots.length} filled {isLocked ? "· Locked" : "· Editable"}
+                  </div>
+                </div>
+                <Button type="button" size="sm" variant="secondary" onClick={() => setDrawerOpen(false)}>
+                  Close
+                </Button>
+              </div>
+
+              <div className="arenaDrawer__body">
+                <div className="arenaDrawer__field">
+                  <label className="ui-muted" htmlFor="arenaSlotSelect">
+                    Slot
+                  </label>
+                  <select
+                    id="arenaSlotSelect"
+                    className="ui-input"
+                    value={selectedSlot?.id ?? ""}
+                    disabled={isPending}
+                    onChange={(e) => setSelectedSlotId(e.target.value)}
+                  >
+                    {slots.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {shortSlotLabel(s)} · {s.athleteId ? athleteName.get(s.athleteId) ?? "Unknown" : "Empty"}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="arenaDrawer__field">
+                  <div className="arenaDrawer__label ui-muted">Athletes</div>
+                  <div className="arenaDrawer__athletes">
+                    {availableAthletes.map((a) => (
+                      <button
+                        key={a.id}
+                        type="button"
+                        className={cn(
+                          "playAthleteButton",
+                          selectedSlot?.athleteId === a.id && "playAthleteButton--active",
+                        )}
+                        onClick={() => onAssignAthlete(a.id)}
+                        disabled={isLocked || isPending}
+                      >
+                        {a.name}
+                      </button>
+                    ))}
+                    <button
+                      type="button"
+                      className="playAthleteButton playAthleteButton--muted"
+                      onClick={() => onAssignAthlete(null)}
+                      disabled={isLocked || isPending}
+                    >
+                      Clear slot
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </section>
           </div>
         </Card>
 
+        {showSidebar ? (
         <Card className="playSidebar">
           <h2>Lineup</h2>
           <p className="ui-muted">Click a 3D card, then assign an athlete.</p>
@@ -299,7 +551,9 @@ export function MatchupPlayClient(props: Props) {
             {isLocked ? "Lineup locked." : "Not locked yet."} {isComplete ? "Ready to play." : "Fill all slots."}
           </p>
         </Card>
+        ) : null}
       </div>
+
     </div>
   );
 }
@@ -315,6 +569,7 @@ function Arena3D({
   opponentAthleteName,
   result,
   matchup,
+  matchState,
 }: {
   userTeam: TeamVm;
   opponentTeam: TeamVm;
@@ -326,6 +581,7 @@ function Arena3D({
   opponentAthleteName: Map<string, string>;
   result: { homeScore: number; awayScore: number } | null;
   matchup: Props["matchup"];
+  matchState: "building" | "ready" | "locked" | "final";
 }) {
   const tokens = useThreeTokens();
   const [quality, setQuality] = useState<"high" | "low">("high");
@@ -352,8 +608,8 @@ function Arena3D({
       }
     : null;
 
-  const leftColor = tokens.lights.fill;
-  const rightColor = tokens.materials.accent.color;
+  const leftColor = teamColor(opponentTeam.id, 0.7, 0.56);
+  const rightColor = teamColor(userTeam.id, 0.7, 0.56);
 
   const winnerSide: "none" | "left" | "right" | "tie" = scores
     ? scores.user > scores.opp
@@ -417,6 +673,7 @@ function Arena3D({
               intensity={tokens.lights.rimIntensity}
               color={tokens.lights.rim}
             />
+            <MovingLights enabled={quality === "high"} leftColor={leftColor} rightColor={rightColor} state={matchState} />
           </>
         ) : (
           <ambientLight intensity={0.6} />
@@ -425,6 +682,9 @@ function Arena3D({
         <OrbitControls
           enablePan={false}
           enableZoom={false}
+          enableDamping
+          autoRotate={quality === "high"}
+          autoRotateSpeed={matchState === "final" ? 0.65 : matchState === "locked" ? 0.42 : 0.22}
           maxPolarAngle={Math.PI / 2.1}
           minPolarAngle={0.6}
         />
@@ -439,6 +699,7 @@ function Arena3D({
         />
 
         <ArenaBase tokens={tokens} />
+        <MatchEnergy state={matchState} winnerSide={winnerSide} leftColor={leftColor} rightColor={rightColor} />
 
         <TeamTotem
           team={opponentTeam}
@@ -551,6 +812,49 @@ function Arena3D({
   );
 }
 
+function MovingLights({
+  enabled,
+  leftColor,
+  rightColor,
+  state,
+}: {
+  enabled: boolean;
+  leftColor: string;
+  rightColor: string;
+  state: "building" | "ready" | "locked" | "final";
+}) {
+  const leftRef = useRef<THREE.PointLight>(null);
+  const rightRef = useRef<THREE.PointLight>(null);
+
+  useFrame(({ clock }) => {
+    if (!enabled) return;
+    const t = clock.getElapsedTime();
+    const speed = state === "final" ? 0.9 : state === "locked" ? 0.6 : 0.35;
+    const r = state === "final" ? 8.2 : state === "locked" ? 7.6 : 7.1;
+    const y = state === "final" ? 5.2 : state === "locked" ? 4.6 : 4.1;
+
+    if (leftRef.current) {
+      leftRef.current.position.set(Math.cos(t * speed) * r, y + Math.sin(t * 0.8) * 0.35, Math.sin(t * speed) * r);
+    }
+    if (rightRef.current) {
+      rightRef.current.position.set(
+        Math.cos(t * speed + Math.PI) * r,
+        y + Math.sin(t * 0.8 + 1.2) * 0.35,
+        Math.sin(t * speed + Math.PI) * r,
+      );
+    }
+  });
+
+  const intensity = state === "final" ? 1.15 : state === "locked" ? 0.85 : 0.55;
+
+  return (
+    <>
+      <pointLight ref={leftRef} intensity={intensity} color={leftColor} distance={18} decay={2} />
+      <pointLight ref={rightRef} intensity={intensity * 0.95} color={rightColor} distance={18} decay={2} />
+    </>
+  );
+}
+
 function ArenaBase({ tokens }: { tokens: ReturnType<typeof useThreeTokens> }) {
   const surface = tokens?.materials.surface;
   const accent = tokens?.materials.accent;
@@ -576,6 +880,67 @@ function ArenaBase({ tokens }: { tokens: ReturnType<typeof useThreeTokens> }) {
           metalness={accent?.metalness ?? 0.35}
         />
       </mesh>
+    </group>
+  );
+}
+
+function MatchEnergy({
+  state,
+  winnerSide,
+  leftColor,
+  rightColor,
+}: {
+  state: "building" | "ready" | "locked" | "final";
+  winnerSide: "none" | "left" | "right" | "tie";
+  leftColor: string;
+  rightColor: string;
+}) {
+  const meshRef = useRef<THREE.Mesh>(null);
+  const lightRef = useRef<THREE.PointLight>(null);
+  const worldPos = useMemo(() => new THREE.Vector3(), []);
+
+  useFrame(({ clock }, delta) => {
+    const mesh = meshRef.current;
+    if (!mesh) return;
+
+    const t = clock.getElapsedTime();
+    const speed = state === "final" ? 1.8 : state === "locked" ? 1.35 : 0.95;
+    const amp = state === "locked" ? 2.35 : 2.0;
+
+    const baseY = state === "locked" ? 1.55 : 1.35;
+    const bob = Math.sin(t * (state === "locked" ? 5.5 : 3.4)) * (state === "locked" ? 0.16 : 0.1);
+
+    if (state === "final" && (winnerSide === "left" || winnerSide === "right")) {
+      const targetX = winnerSide === "left" ? -2.35 : 2.35;
+      mesh.position.x = THREE.MathUtils.damp(mesh.position.x, targetX, 6.5, delta);
+      mesh.position.y = THREE.MathUtils.damp(mesh.position.y, 1.85, 6.5, delta);
+      mesh.position.z = THREE.MathUtils.damp(mesh.position.z, 0.6, 6.5, delta);
+    } else {
+      mesh.position.x = Math.sin(t * speed) * amp;
+      mesh.position.y = baseY + bob;
+      mesh.position.z = 0.45 + Math.cos(t * (speed * 0.8)) * 0.25;
+    }
+
+    const pulse = 1 + Math.sin(t * (state === "final" ? 7.5 : state === "locked" ? 6.2 : 3.8)) * 0.14;
+    mesh.scale.setScalar(pulse);
+
+    if (lightRef.current) {
+      mesh.getWorldPosition(worldPos);
+      lightRef.current.position.copy(worldPos);
+      lightRef.current.intensity = state === "final" ? 1.4 : state === "locked" ? 1.05 : 0.75;
+    }
+  });
+
+  const color =
+    winnerSide === "left" ? leftColor : winnerSide === "right" ? rightColor : winnerSide === "tie" ? "#ffffff" : "#00d4ff";
+
+  return (
+    <group>
+      <mesh ref={meshRef}>
+        <sphereGeometry args={[0.14, 32, 32]} />
+        <meshStandardMaterial color={color} emissive={color} emissiveIntensity={state === "final" ? 1.35 : 0.85} roughness={0.22} metalness={0.35} />
+      </mesh>
+      <pointLight ref={lightRef} color={color} intensity={state === "final" ? 1.3 : 0.85} distance={6} />
     </group>
   );
 }
@@ -645,13 +1010,39 @@ function TeamTotem({
       </mesh>
 
       <Text
-        position={[0, 1.15, 0]}
+        position={[0, 0.22, 0.62]}
+        fontSize={0.34}
+        color={tokens?.text.primary ?? "white"}
+        anchorX="center"
+        anchorY="middle"
+        outlineWidth={0.02}
+        outlineColor="black"
+      >
+        {teamAbbr(team.name)}
+      </Text>
+
+      <RoundedBox args={[2.65, 0.44, 0.06]} radius={0.09} smoothness={6} position={[0, 1.15, 0.06]}>
+        <meshStandardMaterial
+          color={surface?.color ?? "#101225"}
+          roughness={surface?.roughness ?? 0.7}
+          metalness={surface?.metalness ?? 0.2}
+          emissive={teamAccent}
+          emissiveIntensity={isWinner ? 0.18 : 0.08}
+          transparent
+          opacity={0.62}
+        />
+      </RoundedBox>
+
+      <Text
+        position={[0, 1.15, 0.1]}
         fontSize={nameFontSize}
         color={nameColor}
         anchorX="center"
         anchorY="middle"
         maxWidth={2.45}
         textAlign="center"
+        outlineWidth={0.012}
+        outlineColor="black"
       >
         {team.name}
       </Text>
@@ -664,7 +1055,6 @@ function TeamTotem({
           const px = Math.cos(angle) * radius * (side === "left" ? 1 : -1);
           const pz = Math.sin(angle) * radius;
           const position: [number, number, number] = [px, 0, pz];
-          const rotY = (side === "left" ? 1 : -1) * (Math.PI / 2) + (side === "left" ? -angle : angle) * 0.18;
 
           const name =
             slot.athleteId ? athleteName.get(slot.athleteId) ?? "Unknown" : side === "left" ? "Mystery" : "Empty";
@@ -675,7 +1065,7 @@ function TeamTotem({
               title={shortSlotLabel(slot)}
               value={name}
               position={position}
-              rotation={[0, rotY, 0]}
+              rotation={[0, 0, 0]}
               interactive={Boolean(onSelectSlot)}
               selected={selectedSlotId === slot.id}
               onSelect={() => onSelectSlot?.(slot.id)}
@@ -716,51 +1106,80 @@ function LineupCard3D({
   const surface = tokens?.materials.surface;
   const accent = tokens?.materials.accent;
   const teamAccent = accentColor || accent?.color || "#6d5efc";
+  const pivotRef = useRef<THREE.Group>(null);
+  const worldPos = useMemo(() => new THREE.Vector3(), []);
+  const bobSeed = useMemo(() => (fnv1a32(`${title}:${value}`) % 1000) / 1000, [title, value]);
+
+  useFrame(({ camera, clock }, delta) => {
+    const pivot = pivotRef.current;
+    if (!pivot) return;
+
+    pivot.getWorldPosition(worldPos);
+    const dx = camera.position.x - worldPos.x;
+    const dz = camera.position.z - worldPos.z;
+    const yaw = Math.atan2(dx, dz);
+
+    pivot.rotation.set(rotation[0], yaw, rotation[2]);
+
+    const targetScale = selected ? 1.09 : hovered ? 1.05 : 1;
+    const nextScale = THREE.MathUtils.damp(pivot.scale.x, targetScale, 10, delta);
+    pivot.scale.setScalar(nextScale);
+
+    const baseLift = selected ? 0.08 : hovered ? 0.04 : 0;
+    const bob = Math.sin(clock.getElapsedTime() * 2.1 + bobSeed * Math.PI * 2) * 0.02;
+    pivot.position.y = baseLift + bob;
+  });
 
   return (
-    <group position={position} rotation={rotation}>
-      <RoundedBox
-        args={[1.15, 0.62, 0.08]}
-        radius={0.08}
-        smoothness={6}
-        onPointerEnter={() => setHovered(true)}
-        onPointerLeave={() => setHovered(false)}
-        onClick={(e) => {
-          e.stopPropagation();
-          if (!interactive) return;
-          onSelect();
-        }}
-      >
-        <meshStandardMaterial
-          color={surface?.color ?? "#101225"}
-          roughness={surface?.roughness ?? 0.65}
-          metalness={surface?.metalness ?? 0.25}
-          emissive={teamAccent}
-          emissiveIntensity={
-            selected ? accent?.emissiveIntensity ?? 1.2 : hovered ? (accent?.emissiveIntensity ?? 1.2) * 0.5 : 0
-          }
-        />
-      </RoundedBox>
+    <group position={position}>
+      <group ref={pivotRef} rotation={rotation}>
+        <RoundedBox
+          args={[1.15, 0.62, 0.08]}
+          radius={0.08}
+          smoothness={6}
+          onPointerEnter={() => setHovered(true)}
+          onPointerLeave={() => setHovered(false)}
+          onClick={(e) => {
+            e.stopPropagation();
+            if (!interactive) return;
+            onSelect();
+          }}
+        >
+          <meshStandardMaterial
+            color={surface?.color ?? "#101225"}
+            roughness={surface?.roughness ?? 0.65}
+            metalness={surface?.metalness ?? 0.25}
+            emissive={teamAccent}
+            emissiveIntensity={
+              selected ? accent?.emissiveIntensity ?? 1.2 : hovered ? (accent?.emissiveIntensity ?? 1.2) * 0.5 : 0
+            }
+          />
+        </RoundedBox>
 
-      <Text
-        position={[0, 0.14, 0.05]}
-        fontSize={0.13}
-        color={tokens?.text.muted ?? "white"}
-        anchorX="center"
-        anchorY="middle"
-      >
-        {title}
-      </Text>
-      <Text
-        position={[0, -0.12, 0.05]}
-        fontSize={0.14}
-        color={tokens?.text.primary ?? "white"}
-        anchorX="center"
-        anchorY="middle"
-        maxWidth={1.02}
-      >
-        {value}
-      </Text>
+        <Text
+          position={[0, 0.14, 0.05]}
+          fontSize={0.13}
+          color={tokens?.text.muted ?? "white"}
+          anchorX="center"
+          anchorY="middle"
+          outlineWidth={0.006}
+          outlineColor="black"
+        >
+          {title}
+        </Text>
+        <Text
+          position={[0, -0.12, 0.05]}
+          fontSize={0.14}
+          color={tokens?.text.primary ?? "white"}
+          anchorX="center"
+          anchorY="middle"
+          maxWidth={1.02}
+          outlineWidth={0.006}
+          outlineColor="black"
+        >
+          {value}
+        </Text>
+      </group>
     </group>
   );
 }
@@ -778,13 +1197,26 @@ function CenterOrb({
 }) {
   const glass = tokens?.materials.glass;
   const accent = tokens?.materials.accent;
+  const groupRef = useRef<THREE.Group>(null);
 
   const base = glass?.color ?? "#00d4ff";
   const color = state === "final" ? highlightColor : base;
   const intensity = state === "final" ? 0.42 : state === "tie" ? 0.24 : 0.08;
 
+  useFrame(({ clock }) => {
+    const g = groupRef.current;
+    if (!g) return;
+    const t = clock.getElapsedTime();
+    const bobSpeed = state === "final" ? 3.2 : state === "tie" ? 2.4 : 1.7;
+    const bobAmp = state === "final" ? 0.08 : state === "tie" ? 0.06 : 0.05;
+    g.position.y = 1.05 + Math.sin(t * bobSpeed) * bobAmp;
+    g.rotation.y = t * (state === "final" ? 0.9 : 0.35);
+    const pulse = 1 + Math.sin(t * (state === "final" ? 6.3 : 3.1)) * (state === "final" ? 0.06 : 0.02);
+    g.scale.setScalar(pulse);
+  });
+
   return (
-    <group position={[0, 1.05, 0]}>
+    <group ref={groupRef} position={[0, 1.05, 0]}>
       <mesh>
         <sphereGeometry args={[0.62, 64, 64]} />
         <meshPhysicalMaterial
@@ -844,6 +1276,40 @@ function PulseRing({
   );
 }
 
+function ShockwaveRing({
+  position,
+  color,
+  animate,
+}: {
+  position: [number, number, number];
+  color: string;
+  animate: boolean;
+}) {
+  const meshRef = useRef<THREE.Mesh>(null);
+  useFrame(({ clock }) => {
+    const mesh = meshRef.current;
+    if (!mesh || !animate) return;
+    const t = (clock.getElapsedTime() * 0.5) % 1;
+    const scale = 1 + t * 3.2;
+    mesh.scale.setScalar(scale);
+    const mat = mesh.material as THREE.MeshBasicMaterial;
+    mat.opacity = 0.55 * (1 - t);
+  });
+
+  return (
+    <mesh ref={meshRef} rotation={[-Math.PI / 2, 0, 0]} position={position}>
+      <ringGeometry args={[0.9, 1.25, 64]} />
+      <meshBasicMaterial
+        color={color}
+        transparent
+        opacity={0}
+        blending={THREE.AdditiveBlending}
+        depthWrite={false}
+      />
+    </mesh>
+  );
+}
+
 function Trophy3D({ color }: { color: string }) {
   return (
     <group>
@@ -893,6 +1359,7 @@ function VictoryCelebration3D({
   return (
     <group>
       <PulseRing position={[x, 0.01, z]} color={color} animate={animate} />
+      <ShockwaveRing position={[x, 0.01, z]} color={color} animate={animate && winnerSide !== "tie"} />
 
       {winnerSide !== "tie" && animate ? (
         <>
@@ -909,11 +1376,11 @@ function VictoryCelebration3D({
             />
           </mesh>
           <Sparkles
-            count={22}
-            scale={[2.2, 1.4, 2.2]}
+            count={44}
+            scale={[2.7, 1.8, 2.7]}
             size={3}
-            speed={0.85}
-            opacity={0.6}
+            speed={1.15}
+            opacity={0.72}
             color={color}
             position={[x, 2.15, z + 0.45]}
           />

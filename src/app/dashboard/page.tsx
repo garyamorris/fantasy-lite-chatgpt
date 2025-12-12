@@ -2,6 +2,7 @@ import Link from "next/link";
 import { redirect } from "next/navigation";
 import { prisma } from "@/lib/db";
 import { getCurrentUser } from "@/lib/session";
+import { parseRuleSetConfig } from "@/lib/rules";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 
@@ -50,6 +51,16 @@ export default async function DashboardPage() {
                 </div>
                 <p className="ui-muted">
                   {m.league.sport.name} | {m.league.ruleSet.name}
+                </p>
+                <p className="ui-muted" style={{ marginTop: "var(--space-2)", fontSize: "var(--text-sm)" }}>
+                  {(() => {
+                    try {
+                      const cfg = parseRuleSetConfig(m.league.ruleSet.config);
+                      return `Week ${m.league.currentWeek}/${cfg.schedule.weeks} · Play your matchup`;
+                    } catch {
+                      return `Week ${m.league.currentWeek} · Play your matchup`;
+                    }
+                  })()}
                 </p>
               </Card>
             </Link>
